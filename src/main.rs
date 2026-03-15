@@ -6,9 +6,24 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
-use clap::Parser;
+use clap::{CommandFactory, Parser, ValueEnum};
+use clap_complete::{generate, Shell};
 
 mod tui;
+
+// ── Color mode ────────────────────────────────────────────────────────────────
+
+#[derive(Clone, PartialEq, ValueEnum)]
+pub enum ColorMode {
+    /// Full file-type coloring
+    Always,
+    /// Smart: no color when piped, simple when output is busy, full otherwise
+    Auto,
+    /// Color directories and symlinks only
+    Simple,
+    /// No color
+    Never,
+}
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -104,9 +119,9 @@ struct Args {
     #[arg(short = 'D', long = "date")]
     date: bool,
 
-    /// Disable color output
-    #[arg(short = 'n', long = "no-color")]
-    no_color: bool,
+    /// Color mode: always, auto (default), simple, never
+    #[arg(long = "color", value_name = "WHEN", default_value = "auto")]
+    color: ColorMode,
 
     // ── Output format ─────────────────────────────────────────────────────────
     #[clap(next_help_heading = "Output format")]
@@ -129,6 +144,10 @@ struct Args {
     /// Pre-fill the TUI search box
     #[arg(long = "search", value_name = "TERM")]
     search: Option<String>,
+
+    /// Generate shell completions and print to stdout
+    #[arg(long = "generate-completions", value_name = "SHELL", hide = true)]
+    generate_completions: Option<Shell>,
 }
 
 // ── Walk options ──────────────────────────────────────────────────────────────
@@ -156,7 +175,7 @@ pub struct WalkOpts {
     pub ignore: Option<String>,
     pub sort: SortBy,
     pub reverse: bool,
-    pub color: bool,
+    pub color: ColorMode,
     pub root_dev: u64,
     pub output: OutputFmt,
 }
@@ -191,7 +210,19 @@ impl WalkOpts {
             ignore: args.ignore.clone(),
             sort,
             reverse: args.reverse,
-            color: !args.no_color,
+            color: match &args.color {
+                ColorMode::Auto => {
+                    if !io::stdout().is_terminal() {
+                        ColorMode::Never
+                    } else if args.permissions || args.date {
+                        // busy output — file-type colors add noise
+                        ColorMode::Simple
+                    } else {
+                        ColorMode::Always
+                    }
+                }
+                other => other.clone(),
+            },
             root_dev,
             output,
         }
@@ -252,36 +283,28 @@ pub fn ext_ansi_color(ext: &str) -> &'static str {
 }
 
 /// Equivalent color for ratatui (by extension, no exec-bit check).
+/// Derives from ext_ansi_color so both stay in sync automatically.
 pub fn ratatui_color_for_name(name: &str, is_dir: bool) -> ratatui::style::Color {
     use ratatui::style::Color;
     if is_dir { return Color::Blue; }
     let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    match ext.as_str() {
-        "zip"|"tar"|"gz"|"bz2"|"xz"|"7z"|"rar"|"zst"|"lz4"|"cab"|"deb"|"rpm"|"apk"
-            => Color::Red,
-        "png"|"jpg"|"jpeg"|"gif"|"bmp"|"svg"|"ico"|"webp"|"tiff"|"tif"|"psd"|"raw"
-            => Color::Magenta,
-        "mp3"|"wav"|"flac"|"ogg"|"aac"|"m4a"|"opus"|"mid"
-            => Color::Cyan,
-        "mp4"|"mkv"|"avi"|"mov"|"webm"|"flv"|"wmv"|"m4v"
-            => Color::Cyan,
-        "rs"|"c"|"cpp"|"cc"|"h"|"hpp"|"asm"
-            => Color::Yellow,
-        "py"|"rb"|"lua"|"pl"|"php"|"r"|"jl"
-            => Color::Yellow,
-        "js"|"ts"|"jsx"|"tsx"|"html"|"htm"|"css"|"scss"
-            => Color::Yellow,
-        "java"|"kt"|"scala"|"go"|"swift"|"cs"|"fs"
-            => Color::Yellow,
-        "sh"|"bash"|"zsh"|"fish"|"ps1"|"bat"
-            => Color::Green,
-        "toml"|"yaml"|"yml"|"ini"|"conf"|"env"|"json"|"xml"|"csv"|"sql"
-            => Color::DarkGray,
-        "md"|"rst"|"txt"|"org"
-            => Color::White,
-        "lock"|"sum"
-            => Color::DarkGray,
-        _ => Color::Reset,
+    match ext_ansi_color(&ext) {
+        "\x1b[31;1m"      => Color::Red,
+        "\x1b[35;1m"      => Color::Magenta,
+        "\x1b[36m"        => Color::Cyan,
+        "\x1b[96m"        => Color::Cyan,
+        "\x1b[33;1m"      => Color::Yellow,
+        "\x1b[33m"        => Color::Yellow,
+        "\x1b[38;5;214m"  => Color::Yellow,
+        "\x1b[38;5;178m"  => Color::Yellow,
+        "\x1b[32;1m"      => Color::Green,
+        "\x1b[38;5;244m"  => Color::DarkGray,
+        "\x1b[38;5;248m"  => Color::DarkGray,
+        "\x1b[38;5;242m"  => Color::DarkGray,
+        "\x1b[37m"        => Color::White,
+        "\x1b[38;5;209m"  => Color::Rgb(255, 135, 95),
+        "\x1b[38;5;141m"  => Color::Rgb(175, 135, 255),
+        _                 => Color::Reset,
     }
 }
 
@@ -521,26 +544,38 @@ fn format_line(path: &Path, prefix: &str, size: Option<u64>, opts: &WalkOpts) ->
         _ => String::new(),
     };
 
-    if !opts.color {
+    if opts.color == ColorMode::Never {
         return format!("{}{}{}{}{}{}", prefix, perms_str, date_str, display_name, link_str, size_str);
     }
 
     let name_color = if is_dir { "\x1b[34;1m" }
         else if is_link { "\x1b[36;1m" }
+        else if opts.color != ColorMode::Always { "\x1b[0m" }
         else { file_color(path) };
 
-    let link_color = if opts.color { "\x1b[36m" } else { "" };
     let reset = "\x1b[0m";
-    let dim = "\x1b[90m";
+    let dim   = "\x1b[90m";
+    let cyan  = "\x1b[36m";
 
-    format!("{}{}{}{}{}{}{}{}{}{}{}{}{reset}",
-        dim, prefix, reset,
-        dim, perms_str, reset,
-        dim, date_str, reset,
-        name_color, display_name, reset,
-        // link and size
-    ) + &if is_link { format!("{} ->{} {}{}{}", dim, reset, link_color, link_str.trim_start_matches(" -> "), reset) } else { String::new() }
-      + &if size_str.is_empty() { String::new() } else { format!("{}{}{}", dim, size_str, reset) }
+    let mut out = String::new();
+
+    out.push_str(&format!("{dim}{prefix}{reset}"));
+    if !perms_str.is_empty() {
+        out.push_str(&format!("{dim}{perms_str}{reset}"));
+    }
+    if !date_str.is_empty() {
+        out.push_str(&format!("{dim}{date_str}{reset}"));
+    }
+    out.push_str(&format!("{name_color}{display_name}{reset}"));
+    if is_link {
+        let target = link_str.trim_start_matches(" -> ");
+        out.push_str(&format!("{dim} ->{reset} {cyan}{target}{reset}"));
+    }
+    if !size_str.is_empty() {
+        out.push_str(&format!("{dim}{size_str}{reset}"));
+    }
+
+    out
 }
 
 // ── Cursor rewrite for dir sizes ──────────────────────────────────────────────
@@ -746,8 +781,8 @@ fn print_plain(root: &Path, opts: &WalkOpts, pattern: Option<&str>) {
         fix_line_above(child_lines, &format_line(root, "", Some(total_sz), opts));
     }
 
-    let c = if opts.color { "\x1b[90m" } else { "" };
-    let r = if opts.color { "\x1b[0m" } else { "" };
+    let c = if opts.color != ColorMode::Never { "\x1b[90m" } else { "" };
+    let r = if opts.color != ColorMode::Never { "\x1b[0m" } else { "" };
     eprintln!("\n{}{} director{}, {} file{}{}", c,
         counters.dirs, if counters.dirs == 1 { "y" } else { "ies" },
         counters.files, if counters.files == 1 { "" } else { "s" }, r);
@@ -906,6 +941,11 @@ fn load_tree_with_spinner(path: &Path, opts: WalkOpts) -> TreeNode {
 
 fn main() {
     let args = Args::parse();
+
+    if let Some(shell) = args.generate_completions {
+        generate(shell, &mut Args::command(), "rtree", &mut io::stdout());
+        return;
+    }
 
     if args.json && args.xml {
         eprintln!("rtree: -J and -X are mutually exclusive");
