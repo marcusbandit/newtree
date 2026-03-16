@@ -28,14 +28,20 @@ MAJOR_REL="1"
 echo ""
 echo "Current version: $CURRENT"
 echo ""
+echo "  [0] none   →  ${CARGO_VER}-${PKGREL}   (release as-is)"
 echo "  [1] patch  →  ${PATCH_VER}-${PATCH_REL}   (PKGBUILD only, no new tag)"
 echo "  [2] minor  →  ${MINOR_VER}-${MINOR_REL}"
 echo "  [3] major  →  ${MAJOR_VER}-${MAJOR_REL}"
 echo "  [4] custom"
 echo ""
-read -rp "Bump? [1/2/3/4]: " CHOICE
+read -rp "Bump? [0/1/2/3/4]: " CHOICE
 
 case "$CHOICE" in
+    0)
+        NEW_VER="$CARGO_VER"
+        NEW_REL="$PKGREL"
+        PKGBUILD_ONLY=false
+        ;;
     1)
         NEW_VER="$PATCH_VER"
         NEW_REL="$PATCH_REL"
