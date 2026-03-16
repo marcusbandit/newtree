@@ -50,21 +50,19 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Generate completions
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           mkdir -p completions
-          ./target/${{ matrix.target }}/release/rtree --generate-completions bash > completions/rtree.bash
-          ./target/${{ matrix.target }}/release/rtree --generate-completions zsh  > completions/_rtree
-          ./target/${{ matrix.target }}/release/rtree --generate-completions fish > completions/rtree.fish
+          # Build for the host so we can actually run the binary (cross-compiled
+          # binaries can't execute on the runner). Completions are arch-independent.
+          cargo build --release --quiet
+          ./target/release/rtree --generate-completions bash > completions/rtree.bash
+          ./target/release/rtree --generate-completions zsh  > completions/_rtree
+          ./target/release/rtree --generate-completions fish > completions/rtree.fish
 
       - name: Build .deb
         if: matrix.deb
         run: |
           cargo install cargo-deb --locked
-          mkdir -p completions
-          ./target/${{ matrix.target }}/release/rtree --generate-completions bash > completions/rtree.bash
-          ./target/${{ matrix.target }}/release/rtree --generate-completions zsh  > completions/_rtree
-          ./target/${{ matrix.target }}/release/rtree --generate-completions fish > completions/rtree.fish
           cargo deb --no-build --target ${{ matrix.target }}
 
       - name: Rename binary
