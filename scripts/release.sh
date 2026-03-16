@@ -136,7 +136,7 @@ else
 
     echo "[5/8] Committing and tagging $TAG..."
     git add Cargo.toml Cargo.lock completions/
-    git commit -m "release $TAG"
+    git diff --cached --quiet || git commit -m "release $TAG"
     git tag "$TAG"
 
     echo "[6/8] Pushing to GitHub..."
@@ -160,7 +160,7 @@ else
     sed -i "s/^pkgrel=.*/pkgrel=${NEW_REL}/" PKGBUILD
     sed -i "s/sha256sums=('.*')/sha256sums=('${SHA}')/" PKGBUILD
     git add PKGBUILD
-    git commit -m "update PKGBUILD for $TAG"
+    git diff --cached --quiet || git commit -m "update PKGBUILD for $TAG"
     git push origin main
 fi
 
