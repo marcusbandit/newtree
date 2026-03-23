@@ -1,0 +1,99 @@
+name: Build and publish apt repository
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build .deb package
+        run: cargo deb
+
+      - name: Import GPG signing key
+        run: |
+          echo "${{ secrets.APT_SIGNING_KEY }}" | gpg --batch --import
+          gpg --list-secret-keys
+
+      - name: Checkout gh-pages (or create it)
+        run: |
+          git fetch origin gh-pages 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/gh-pages; then
+            git worktree add apt-repo gh-pages
+          else
+            git worktree add --orphan apt-repo
+            cd apt-repo && git checkout --orphan gh-pages
+          fi
+
+      - name: Add package and rebuild repository index
+        run: |
+          DEB=$(ls target/debian/*.deb | head -1)
+          FNAME=$(basename "$DEB")
+
+          mkdir -p apt-repo/pool/main/
+          cp "$DEB" apt-repo/pool/main/
+
+          # Copy public key so users can fetch it
+          cp KEY.gpg apt-repo/KEY.gpg
+
+          # Build Packages index
+          mkdir -p apt-repo/dists/stable/main/binary-amd64/
+          cd apt-repo
+          dpkg-scanpackages pool/main/ /dev/null \
+            > dists/stable/main/binary-amd64/Packages
+          gzip -k -f dists/stable/main/binary-amd64/Packages
+          bzip2 -k -f dists/stable/main/binary-amd64/Packages
+
+          # Build Release file
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin="rtree" \
+            -o APT::FTPArchive::Release::Label="rtree" \
+            -o APT::FTPArchive::Release::Suite="stable" \
+            -o APT::FTPArchive::Release::Codename="stable" \
+            -o APT::FTPArchive::Release::Architectures="amd64" \
+            -o APT::FTPArchive::Release::Components="main" \
+            -o APT::FTPArchive::Release::Description="rtree apt repository" \
+            release dists/stable/ > dists/stable/Release
+
+          # Sign Release
+          gpg --batch --yes --default-key "marcusbanditten@gmail.com" \
+            --armor --detach-sign \
+            -o dists/stable/Release.gpg dists/stable/Release
+          gpg --batch --yes --default-key "marcusbanditten@gmail.com" \
+            --clearsign \
+            -o dists/stable/InRelease dists/stable/Release
+
+      - name: Commit and push to gh-pages
+        run: |
+          cd apt-repo
+          git config user.name  "Marcus Rosado"
+          git config user.email "marcusbanditten@gmail.com"
+          git add -A
+          VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+          git commit -m "apt: publish rtree ${VERSION:-$(date +%Y%m%d)}" || echo "Nothing to commit"
+          git push origin gh-pages
