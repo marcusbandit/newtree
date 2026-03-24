@@ -8,7 +8,7 @@ url="https://github.com/marcusbandit/newtree"
 license=('MIT')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/marcusbandit/$pkgname/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('23b7791d6bf2e5b7dc2ab6a641f506ef3d95d910a7b3d55262ec6a1b8adc9b42')
+sha256sums=('fc21e0e05c17562f8a7eb3381fb446576ca494c8fb5a11c1ecd3f51d75515b1b')
 
 prepare() {
   cd "$pkgname-$pkgver"

@@ -24,6 +24,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             deb: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            deb: false
 
     steps:
       - uses: actions/checkout@v4

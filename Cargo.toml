@@ -2,6 +2,14 @@
 name = "newtree"
 version = "0.2.0"
 edition = "2021"
+description = "A modern reimagining of the classic tree command with icons, color, and sane pattern filtering"
+repository = "https://github.com/marcusbandit/newtree"
+homepage = "https://github.com/marcusbandit/newtree"
+license = "MIT"
+keywords = ["tree", "files", "cli", "tui", "filesystem"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+exclude = [".github", "completions"]
 
 [[bin]]
 name = "nt"
