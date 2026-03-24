@@ -2,7 +2,7 @@
 pkgname=newtree
 pkgver=0.2.0
 pkgrel=1
-pkgdesc="A fast tree command with smart pattern filtering and live-search TUI"
+pkgdesc="A modern reimagining of the classic tree command with icons, color, and sane pattern filtering"
 arch=('x86_64')
 url="https://github.com/marcusbandit/newtree"
 license=('MIT')

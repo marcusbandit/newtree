@@ -20,7 +20,7 @@ phf = { version = "0.11", features = ["macros"] }
 maintainer = "Marcus Bandit <marcusbanditten@gmail.com>"
 copyright = "2026 marcusbandit"
 license-file = ["LICENSE", "0"]
-extended-description = "A fast tree command with smart pattern filtering and a live-search TUI. Unlike tree's -P flag, newtree prunes the output to only show paths that lead to a match."
+extended-description = "A modern reimagining of the classic tree command. Keeps the familiar interface but fixes pattern filtering to actually prune output, adds Nerd Font icons, color, and a live-search TUI."
 depends = "$auto"
 section = "utils"
 priority = "optional"

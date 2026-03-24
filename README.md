@@ -1,6 +1,10 @@
 # newtree
 
-A fast, colorful `tree` replacement with smart pattern filtering and a live-search TUI.
+A modern reimagining of the classic `tree` command — designed to actually show you what you're looking for.
+
+`tree` has been around since the 80s and the interface shows it. `newtree` keeps everything familiar but fixes the parts that never made sense, and adds the features you'd expect from a modern tool: icons, color, a live-search TUI, and pattern filtering that actually prunes the output instead of lying to you.
+
+Use it as `nt` for day-to-day use, or `newtree` to see the help.
 
 ## Why?
 
