@@ -1,6 +1,6 @@
 # Maintainer: Marcus Bandit <marcusbanditten@gmail.com>
 pkgname=newtree
-pkgver=0.1.1
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="A fast tree command with smart pattern filtering and live-search TUI"
 arch=('x86_64')
