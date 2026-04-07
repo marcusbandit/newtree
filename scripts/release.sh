@@ -130,9 +130,9 @@ else
 
     echo "[4/8] Generating completions..."
     mkdir -p completions
-    ./target/release/rtree --generate-completions bash > completions/rtree.bash
-    ./target/release/rtree --generate-completions zsh  > completions/_rtree
-    ./target/release/rtree --generate-completions fish > completions/rtree.fish
+    ./target/release/nt --generate-completions bash > completions/nt.bash
+    ./target/release/nt --generate-completions zsh  > completions/_nt
+    ./target/release/nt --generate-completions fish > completions/nt.fish
 
     echo "[5/8] Committing and tagging $TAG..."
     git add Cargo.toml Cargo.lock completions/
@@ -144,7 +144,7 @@ else
     git push origin "$TAG"
 
     echo "[7/8] Fetching tarball sha256..."
-    TARBALL_URL="https://github.com/marcusbandit/rtree/archive/refs/tags/$TAG.tar.gz"
+    TARBALL_URL="https://github.com/marcusbandit/newtree/archive/refs/tags/$TAG.tar.gz"
     SHA=""
     for i in $(seq 1 15); do
         SHA=$(curl -sL "$TARBALL_URL" | sha256sum | awk '{print $1}')
@@ -166,14 +166,14 @@ fi
 
 echo ""
 echo "=== Done! GitHub is building binaries. ==="
-echo "    https://github.com/marcusbandit/rtree/actions"
+echo "    https://github.com/marcusbandit/newtree/actions"
 echo ""
 echo "To push to AUR (needs SSH agent):"
 echo ""
-echo "  cd /tmp && rm -rf aur-rtree && \\"
-echo "  git clone ssh://aur@aur.archlinux.org/rtree.git aur-rtree && \\"
-echo "  cp $ROOT/PKGBUILD aur-rtree/ && \\"
-echo "  cd aur-rtree && \\"
+echo "  cd /tmp && rm -rf aur-newtree && \\"
+echo "  git clone ssh://aur@aur.archlinux.org/newtree.git aur-newtree && \\"
+echo "  cp $ROOT/PKGBUILD aur-newtree/ && \\"
+echo "  cd aur-newtree && \\"
 echo "  makepkg --printsrcinfo > .SRCINFO && \\"
 echo "  git add PKGBUILD .SRCINFO && \\"
 echo "  git commit -m \"release ${NEW_VER}-${NEW_REL}\" && \\"
