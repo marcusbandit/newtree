@@ -73,8 +73,9 @@ jobs:
           cp target/x86_64-unknown-linux-gnu/debian/*.deb  apt-repo/pool/main/
           cp target/aarch64-unknown-linux-gnu/debian/*.deb apt-repo/pool/main/
 
-          # Copy public key so users can fetch it
-          cp KEY.gpg apt-repo/KEY.gpg
+          # Export the public half of the signing key we just imported, so the
+          # published KEY.gpg can never drift from the key that signs Release.
+          gpg --armor --export "marcusbanditten@gmail.com" > apt-repo/KEY.gpg
 
           # Build per-arch Packages indices
           mkdir -p apt-repo/dists/stable/main/binary-amd64/
