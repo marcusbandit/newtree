@@ -33,10 +33,15 @@ never\:"No color"))' \
 '--dirs-only[List directories only]' \
 '-l[Follow symbolic links like directories]' \
 '--follow-links[Follow symbolic links like directories]' \
-'-f[Print the full path prefix for each file]' \
-'--full-path[Print the full path prefix for each file]' \
+'-f[Print the absolute path for each entry]' \
+'--full-path[Print the absolute path for each entry]' \
+'-R[Print paths relative to the current directory]' \
+'--relative[Print paths relative to the current directory]' \
 '-x[Stay on the current filesystem only]' \
 '--one-file-system[Stay on the current filesystem only]' \
+'-g[Respect .gitignore files while walking]' \
+'--gitignore[Respect .gitignore files while walking]' \
+'--filelimit[Do not descend into directories with more than N entries]:N:' \
 '--prune[Prune empty directories from the output]' \
 '-v[Sort files alphanumerically by version (natural sort)]' \
 '--version-sort[Sort files alphanumerically by version (natural sort)]' \
@@ -56,6 +61,10 @@ never\:"No color"))' \
 '--permissions[Print file type and permissions, e.g. \[drwxr-xr-x\]]' \
 '-D[Print the date of last modification (or status change with -c)]' \
 '--date[Print the date of last modification (or status change with -c)]' \
+'-F[Append / * @ | = indicators to names, like ls -F]' \
+'--classify[Append / * @ | = indicators to names, like ls -F]' \
+'-o[Write the tree to FILE instead of stdout]:FILE:_files' \
+'--output[Write the tree to FILE instead of stdout]:FILE:_files' \
 '-J[Print a JSON representation of the tree]' \
 '--json[Print a JSON representation of the tree]' \
 '-X[Print an XML representation of the tree]' \

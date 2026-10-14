@@ -62,11 +62,14 @@ nt [OPTIONS] [PATH]
 | `-a` | Show hidden files |
 | `-d` | Directories only |
 | `-l` | Follow symlinks |
-| `-f` | Print full paths |
+| `-f` | Print absolute paths |
+| `-R` | Print paths relative to the current directory (`--relative`) |
 | `-x` | Stay on one filesystem |
 | `-L <N>` | Limit depth to N |
 | `-P <PATTERN>` | Show only entries matching pattern |
 | `-I <PATTERN>` | Exclude entries matching pattern |
+| `-g` | Respect `.gitignore` files while walking |
+| `--filelimit <N>` | Don't descend into directories with more than N entries |
 | `--prune` | Prune empty directories |
 
 ### Sorting options
@@ -87,6 +90,7 @@ nt [OPTIONS] [PATH]
 | `-H` | Human-readable sizes |
 | `-p` | Show permissions |
 | `-D` | Show last modified date |
+| `-F` | Append `/ * @ \| =` indicators to names, like `ls -F` |
 
 ### Icons
 
@@ -119,7 +123,10 @@ nt --json    # JSON
 nt --xml     # XML
 nt --tui     # Interactive live-search TUI
 nt --tui --search foo   # TUI with pre-filled search
+nt -o tree.txt          # write to a file (summary still goes to stderr)
 ```
+
+With `-f`/`-R`, JSON and XML output also include a `path` field, so pipes like `nt -J -R | jq -r .path` give usable paths.
 
 ## License
 

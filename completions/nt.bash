@@ -23,7 +23,7 @@ _rtree() {
 
     case "${cmd}" in
         rtree)
-            opts="-a -d -l -f -x -L -P -I -v -t -c -U -r -s -H -p -D -J -X -h --all --dirs-only --follow-links --full-path --one-file-system --level --pattern --ignore --prune --version-sort --time-sort --change-sort --unsorted --reverse --size --human --permissions --date --color --json --xml --tui --search --generate-completions --help [PATH]"
+            opts="-a -d -l -f -x -L -P -m -I -v -t -c -U -r -s -H -h -p -D -F -J -X -o -R -g --all --dirs-only --follow-links --full-path --relative --one-file-system --gitignore --filelimit --prune --level --pattern --max-matches --ignore --version-sort --time-sort --change-sort --unsorted --reverse --size --human --permissions --date --classify --color --json --output --xml --tui --search --generate-completions --help [PATH]"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

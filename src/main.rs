@@ -60,9 +60,13 @@ struct Args {
     #[arg(short = 'l', long = "follow-links")]
     follow_links: bool,
 
-    /// Print the full path prefix for each file
+    /// Print the absolute path for each entry
     #[arg(short = 'f', long = "full-path")]
     full_path: bool,
+
+    /// Print paths relative to the current directory
+    #[arg(short = 'R', long = "relative")]
+    relative: bool,
 
     /// Stay on the current filesystem only
     #[arg(short = 'x', long = "one-file-system")]
@@ -87,6 +91,14 @@ struct Args {
     /// Prune empty directories from the output
     #[arg(long = "prune")]
     prune: bool,
+
+    /// Respect .gitignore files while walking
+    #[arg(short = 'g', long = "gitignore")]
+    gitignore: bool,
+
+    /// Do not descend into directories with more than N entries
+    #[arg(long = "filelimit", value_name = "N")]
+    filelimit: Option<usize>,
 
     // ── Sorting ───────────────────────────────────────────────────────────────
     #[clap(next_help_heading = "Sorting options")]
@@ -130,6 +142,10 @@ struct Args {
     #[arg(short = 'D', long = "date")]
     date: bool,
 
+    /// Append / * @ | = indicators to names, like ls -F
+    #[arg(short = 'F', long = "classify")]
+    classify: bool,
+
     /// Color mode: always, auto (default), simple, never
     #[arg(long = "color", value_name = "WHEN", default_value = "auto")]
     color: ColorMode,
@@ -148,6 +164,10 @@ struct Args {
     /// Print a JSON representation of the tree
     #[arg(short = 'J', long = "json")]
     json: bool,
+
+    /// Write the tree to FILE instead of stdout
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    output_file: Option<PathBuf>,
 
     /// Print an XML representation of the tree
     #[arg(short = 'X', long = "xml")]
@@ -188,6 +208,11 @@ pub struct WalkOpts {
     pub dirs_only: bool,
     pub follow_links: bool,
     pub full_path: bool,
+    /// When set, format paths relative to this base (the cwd)
+    pub relative_base: Option<PathBuf>,
+    pub gitignore: bool,
+    pub filelimit: Option<usize>,
+    pub classify: bool,
     pub one_fs: bool,
     pub size: bool,
     pub human: bool,
@@ -240,6 +265,10 @@ impl WalkOpts {
             dirs_only: args.dirs_only,
             follow_links: args.follow_links,
             full_path: args.full_path,
+            relative_base: if args.relative { std::env::current_dir().ok() } else { None },
+            gitignore: args.gitignore,
+            filelimit: args.filelimit,
+            classify: args.classify,
             one_fs: args.one_fs,
             size: args.size || args.human,
             human: args.human,
@@ -531,9 +560,59 @@ fn stop_spinner() {
     if let Some(h) = handle { let _ = h.join(); }
 }
 
+// ── .gitignore stack ──────────────────────────────────────────────────────────
+//
+// Immutable, cheaply cloneable stack of .gitignore matchers, one per directory
+// level (innermost last). Cloning shares the stack via Arc; `desc` returns a
+// new stack with the directory's own .gitignore pushed, so parallel walkers
+// (rayon) can each hold their own stack without locking.
+
+#[derive(Clone)]
+struct GiStack {
+    cwd: Arc<PathBuf>,
+    stack: Arc<Vec<(PathBuf, ignore::gitignore::Gitignore)>>,
+}
+
+impl GiStack {
+    fn root() -> Self {
+        GiStack {
+            cwd: Arc::new(std::env::current_dir().unwrap_or_default()),
+            stack: Arc::new(vec![]),
+        }
+    }
+
+    /// Stack valid inside `dir` (with dir's own .gitignore applied, if -g).
+    fn desc(&self, dir: &Path, enabled: bool) -> GiStack {
+        if !enabled { return self.clone(); }
+        let gi_path = dir.join(".gitignore");
+        if !gi_path.is_file() { return self.clone(); }
+        let abs_dir = if dir.is_absolute() { dir.to_path_buf() } else { self.cwd.join(dir) };
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(&abs_dir);
+        if builder.add(&gi_path).is_some() { return self.clone(); }
+        let gi = match builder.build() { Ok(g) => g, Err(_) => return self.clone() };
+        let mut v = (*self.stack).clone();
+        v.push((abs_dir, gi));
+        GiStack { cwd: Arc::clone(&self.cwd), stack: Arc::new(v) }
+    }
+
+    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        if self.stack.is_empty() { return false; }
+        let abs = if path.is_absolute() { path.to_path_buf() } else { self.cwd.join(path) };
+        // Innermost .gitignore wins; `!` negation only affects its own level.
+        for (_, gi) in self.stack.iter().rev() {
+            match gi.matched(&abs, is_dir) {
+                ignore::Match::Ignore(_) => return true,
+                ignore::Match::Whitelist(_) => return false,
+                ignore::Match::None => {}
+            }
+        }
+        false
+    }
+}
+
 // ── read_children ─────────────────────────────────────────────────────────────
 
-pub fn read_children(path: &Path, opts: &WalkOpts) -> Vec<PathBuf> {
+fn read_children(path: &Path, opts: &WalkOpts, gi: &GiStack) -> Vec<PathBuf> {
     let mut entries: Vec<PathBuf> = match std::fs::read_dir(path) {
         Ok(rd) => rd.filter_map(|e| e.ok())
             .filter(|e| {
@@ -564,6 +643,7 @@ pub fn read_children(path: &Path, opts: &WalkOpts) -> Vec<PathBuf> {
                 // -x one filesystem
                 !opts.one_fs || p.symlink_metadata().map(|m| m.dev()).unwrap_or(0) == opts.root_dev
             })
+            .filter(|p| !gi.is_ignored(p, is_dir_entry(p, opts.follow_links)))
             .collect(),
         Err(_) => return vec![],
     };
@@ -614,15 +694,84 @@ pub fn read_children(path: &Path, opts: &WalkOpts) -> Vec<PathBuf> {
 
 // ── format_line ───────────────────────────────────────────────────────────────
 
+/// Clean, absolute form of `p`: joined with the cwd when relative, with `.`
+/// and `..` resolved lexically (symlinks are left untouched).
+fn normalize_abs(p: &Path) -> PathBuf {
+    let abs = if p.is_absolute() { p.to_path_buf() }
+        else { std::env::current_dir().unwrap_or_default().join(p) };
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => { out.pop(); }
+            _ => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Path of `p` relative to `base`, using `..` segments when p sits above base.
+fn relative_to(p: &Path, base: &Path) -> PathBuf {
+    let mut pc = p.components().peekable();
+    let mut bc = base.components().peekable();
+    while let (Some(&b), Some(&c)) = (pc.peek(), bc.peek()) {
+        if b == c { pc.next(); bc.next(); } else { break; }
+    }
+    let mut out = PathBuf::new();
+    for _ in bc { out.push(".."); }
+    out.extend(pc.map(|c| c.as_os_str()));
+    if out.as_os_str().is_empty() { out.push("."); }
+    out
+}
+
+/// Name shown for `path` given the current path-mode flags.
+fn display_path(path: &Path, opts: &WalkOpts) -> String {
+    if opts.full_path {
+        path.to_string_lossy().to_string()
+    } else if let Some(base) = &opts.relative_base {
+        relative_to(path, base).to_string_lossy().to_string()
+    } else {
+        node_name(path)
+    }
+}
+
+/// ls -F style indicator for `path`, or None when -F is off.
+#[allow(unused_assignments)]
+fn classify_char(path: &Path, is_dir: bool, is_link: bool, opts: &WalkOpts) -> Option<&'static str> {
+    if !opts.classify { return None; }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        if let Ok(m) = path.symlink_metadata() {
+            let ft = m.file_type();
+            return Some(if ft.is_symlink() { "@" }
+                else if ft.is_dir() { "/" }
+                else if ft.is_fifo() { "|" }
+                else if ft.is_socket() { "=" }
+                else if m.permissions().mode() & 0o111 != 0 { "*" }
+                else { "" });
+        }
+    }
+    let _ = (is_dir, is_link);
+    None
+}
+
+fn filelimit_note(n: usize, opts: &WalkOpts) -> String {
+    match opts.filelimit {
+        Some(limit) if n > limit => {
+            let s = format!(" [not descending: > {} entries]", limit);
+            if opts.color != ColorMode::Never { format!("\x1b[90m{}\x1b[0m", s) } else { s }
+        }
+        _ => String::new(),
+    }
+}
+
 fn format_line(path: &Path, prefix: &str, size: Option<u64>, opts: &WalkOpts) -> String {
     let is_dir  = is_dir_entry(path, opts.follow_links);
     let is_link = path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false);
 
-    let display_name = if opts.full_path {
-        path.to_string_lossy().to_string()
-    } else {
-        node_name(path)
-    };
+    let display_name = display_path(path, opts);
+    let classify = classify_char(path, is_dir, is_link, opts).unwrap_or("");
 
     // Icon (Nerd Font)
     let icon_char = if opts.icons {
@@ -661,7 +810,7 @@ fn format_line(path: &Path, prefix: &str, size: Option<u64>, opts: &WalkOpts) ->
 
     if opts.color == ColorMode::Never {
         let icon_part = icon_char.map(|c| format!("{} ", c)).unwrap_or_default();
-        return format!("{}{}{}{}{}{}{}", prefix, perms_str, date_str, icon_part, display_name, link_str, size_str);
+        return format!("{}{}{}{}{}{}{}{}", prefix, perms_str, date_str, icon_part, display_name, classify, link_str, size_str);
     }
 
     let name_color = if is_dir {
@@ -688,7 +837,7 @@ fn format_line(path: &Path, prefix: &str, size: Option<u64>, opts: &WalkOpts) ->
     if let Some(ic) = icon_char {
         out.push_str(&format!("{name_color}{ic} {reset}"));
     }
-    out.push_str(&format!("{name_color}{display_name}{reset}"));
+    out.push_str(&format!("{name_color}{display_name}{classify}{reset}"));
     if is_link {
         let target = link_str.trim_start_matches(" -> ");
         out.push_str(&format!("{dim} ->{reset} {cyan}{target}{reset}"));
@@ -744,7 +893,7 @@ fn child_indent(prefix: &str, is_last: bool, depth: usize) -> String {
 pub struct Counters { pub files: usize, pub dirs: usize }
 
 fn stream_node(
-    path: &Path, opts: &WalkOpts,
+    path: &Path, opts: &WalkOpts, gi: &GiStack,
     prefix: &str, is_last: bool, depth: usize,
     counters: &mut Counters, tty: bool,
 ) -> (u64, usize) {
@@ -758,6 +907,10 @@ fn stream_node(
         return (sz, 1);
     }
 
+    let gi_child = gi.desc(path, opts.gitignore);
+    let children = read_children(path, opts, &gi_child);
+    let limit_note = filelimit_note(children.len(), opts);
+
     // When dirs_only is active, files are never traversed so we can't accumulate
     // their sizes bottom-up. Pre-compute the full recursive size upfront instead.
     let precomputed_sz = if opts.size && opts.dirs_only {
@@ -766,20 +919,23 @@ fn stream_node(
         None
     };
 
-    println!("{}", format_line(path, &conn, precomputed_sz, opts));
+    println!("{}{}", format_line(path, &conn, precomputed_sz, opts), limit_note);
     counters.dirs += 1;
+
+    if !limit_note.is_empty() {
+        return (precomputed_sz.unwrap_or(0), 1);
+    }
 
     if !opts.max_depth.map_or(true, |m| depth < m) {
         return (precomputed_sz.unwrap_or(0), 1);
     }
 
-    let children = read_children(path, opts);
     let n = children.len();
     let mut total_sz = 0u64;
     let mut child_lines = 0usize;
 
     for (i, child) in children.iter().enumerate() {
-        let (sz, lines) = stream_node(child, opts, &indent, i == n - 1, depth + 1, counters, tty);
+        let (sz, lines) = stream_node(child, opts, &gi_child, &indent, i == n - 1, depth + 1, counters, tty);
         total_sz += sz;
         child_lines += lines;
     }
@@ -787,7 +943,7 @@ fn stream_node(
     if opts.size && tty && !opts.dirs_only {
         let th = crossterm::terminal::size().map(|(_, r)| r as usize).unwrap_or(0);
         if child_lines < th {
-            fix_line_above(child_lines, &format_line(path, &conn, Some(total_sz), opts));
+            fix_line_above(child_lines, &(format_line(path, &conn, Some(total_sz), opts) + &limit_note));
         }
     }
 
@@ -805,7 +961,7 @@ fn stream_node(
 /// Used to pre-filter children so `is_last` connectors are assigned correctly.
 fn will_produce_output(
     path: &Path, pattern: &Regex, all_files: bool, force_show: bool,
-    opts: &WalkOpts, depth: usize,
+    opts: &WalkOpts, gi: &GiStack, depth: usize,
 ) -> bool {
     let name = node_name(path);
     let is_dir = is_dir_entry(path, opts.follow_links);
@@ -813,13 +969,14 @@ fn will_produce_output(
     if force_show || name_matches { return true; }
     if !is_dir { return all_files; }
     if !opts.max_depth.map_or(true, |m| depth < m) { return false; }
-    read_children(path, opts).into_par_iter()
-        .any(|child| will_produce_output(&child, pattern, all_files, false, opts, depth + 1))
+    let gi_child = gi.desc(path, opts.gitignore);
+    read_children(path, opts, &gi_child).into_par_iter()
+        .any(|child| will_produce_output(&child, pattern, all_files, false, opts, &gi_child, depth + 1))
 }
 
 fn stream_filtered(
     path: &Path, pattern: &Regex, all_files_visible: bool,
-    opts: &WalkOpts,
+    opts: &WalkOpts, gi: &GiStack,
     prefix: &str, is_last: bool, depth: usize,
     force_show: bool,
     counters: &mut Counters, matched: &mut usize, pending: &mut Vec<String>, tty: bool,
@@ -853,6 +1010,9 @@ fn stream_filtered(
 
     // ── Directory ─────────────────────────────────────────────────────────────
     let can_descend = opts.max_depth.map_or(true, |m| depth < m);
+    let gi_child = gi.desc(path, opts.gitignore);
+    let children = if can_descend { Some(read_children(path, opts, &gi_child)) } else { None };
+    let limit_note = children.as_ref().map_or(String::new(), |c| filelimit_note(c.len(), opts));
 
     if show && !opts.prune {
         let mut flushed = 0usize;
@@ -865,22 +1025,20 @@ fn stream_filtered(
         } else {
             None
         };
-        println!("{}", format_line(path, &conn, precomputed_sz, opts));
+        println!("{}{}", format_line(path, &conn, precomputed_sz, opts), limit_note);
         counters.dirs += 1;
         if name_matches { *matched += 1; }
 
         let mut total_sz = 0u64;
         let mut child_lines = 0usize;
-        if can_descend {
-            let children = read_children(path, opts);
-
+        if let Some(children) = children.filter(|_| limit_note.is_empty()) {
             if opts.match_dirs && name_matches {
                 // This dir matched — show its immediate children (including files).
                 // read_children skips plain files when match_dirs=true, so re-read
                 // with match_dirs=false to get the full directory listing.
                 let mut full_opts = opts.clone();
                 full_opts.match_dirs = false;
-                let full_children = read_children(path, &full_opts);
+                let full_children = read_children(path, &full_opts, &gi_child);
                 let nf = full_children.len();
                 for (i, child) in full_children.iter().enumerate() {
                     let child_conn = connector(&indent, i == nf - 1, depth + 1);
@@ -896,13 +1054,13 @@ fn stream_filtered(
                 // is_last connectors (└── vs ├──) are based on the visible set.
                 let subtree_force = force_show || name_matches;
                 let visible: Vec<PathBuf> = children.into_par_iter()
-                    .filter(|c| will_produce_output(c, pattern, all_files_visible, subtree_force, opts, depth + 1))
+                    .filter(|c| will_produce_output(c, pattern, all_files_visible, subtree_force, opts, &gi_child, depth + 1))
                     .collect();
                 let m = visible.len();
                 let mut inner: Vec<String> = Vec::new();
                 for (i, child) in visible.iter().enumerate() {
                     let (_, sz, lines) = stream_filtered(
-                        child, pattern, all_files_visible, opts,
+                        child, pattern, all_files_visible, opts, &gi_child,
                         &indent, i == m - 1, depth + 1, subtree_force,
                         counters, matched, &mut inner, tty,
                     );
@@ -914,7 +1072,7 @@ fn stream_filtered(
         if opts.size && tty && !opts.dirs_only {
             let th = crossterm::terminal::size().map(|(_, r)| r as usize).unwrap_or(0);
             if child_lines < th {
-                fix_line_above(child_lines, &format_line(path, &conn, Some(total_sz), opts));
+                fix_line_above(child_lines, &(format_line(path, &conn, Some(total_sz), opts) + &limit_note));
             }
         }
         return (true, precomputed_sz.unwrap_or(total_sz), flushed + 1 + child_lines);
@@ -928,16 +1086,16 @@ fn stream_filtered(
     let mut total_sz = 0u64;
     let mut child_lines = 0usize;
 
-    if can_descend {
-        let children = read_children(path, opts);
-        // Pre-filter for correct is_last connectors
-        let visible: Vec<PathBuf> = children.into_par_iter()
-            .filter(|c| will_produce_output(c, pattern, all_files_visible, false, opts, depth + 1))
+    // A filelimit-exceeded dir can't be scanned, so it only ever shows itself
+    // (via the match check) — never its descendants.
+    if children.as_ref().map_or(false, |_| limit_note.is_empty()) {
+        let visible: Vec<PathBuf> = children.unwrap().into_par_iter()
+            .filter(|c| will_produce_output(c, pattern, all_files_visible, false, opts, &gi_child, depth + 1))
             .collect();
         let m = visible.len();
         for (i, child) in visible.iter().enumerate() {
             let (prod, sz, lines) = stream_filtered(
-                child, pattern, all_files_visible, opts,
+                child, pattern, all_files_visible, opts, &gi_child,
                 &indent, i == m - 1, depth + 1, false,
                 counters, matched, pending, tty,
             );
@@ -956,19 +1114,22 @@ fn stream_filtered(
 
 // ── Plain mode entry ──────────────────────────────────────────────────────────
 
-fn print_plain(root: &Path, opts: &WalkOpts, pattern: Option<&str>) {
+fn print_plain(root: &Path, opts: &WalkOpts, gi: &GiStack, pattern: Option<&str>) {
     // Strip trailing slash — it's the folder-search signal, not part of the pattern
     let pattern = pattern.map(|p| p.trim_end_matches('/'));
     let tty = io::stdout().is_terminal();
     let mut counters = Counters { files: 0, dirs: 0 };
 
-    println!("{}", format_line(root, "", None, opts));
+    let gi_root = gi.desc(root, opts.gitignore);
+    let root_children = opts.max_depth.map_or(true, |m| 0 < m)
+        .then(|| read_children(root, opts, &gi_root));
+    let limit_note = root_children.as_ref().map_or(String::new(), |c| filelimit_note(c.len(), opts));
 
-    let can_descend = opts.max_depth.map_or(true, |m| 0 < m);
+    println!("{}{}", format_line(root, "", None, opts), limit_note);
+
     let mut total_sz = 0u64;
 
-    if can_descend {
-        let children = read_children(root, opts);
+    if let Some(children) = root_children.filter(|_| limit_note.is_empty()) {
         let n = children.len();
         let use_filter = pattern.is_some() || opts.prune;
 
@@ -1007,12 +1168,12 @@ fn print_plain(root: &Path, opts: &WalkOpts, pattern: Option<&str>) {
             let mut matched = 0usize;
             // Pre-filter root children for correct is_last connectors
             let visible: Vec<PathBuf> = children.into_par_iter()
-                .filter(|c| will_produce_output(c, &pat, all_files, false, opts, 1))
+                .filter(|c| will_produce_output(c, &pat, all_files, false, opts, &gi_root, 1))
                 .collect();
             let m = visible.len();
             for (i, child) in visible.iter().enumerate() {
                 let (_, sz, _) = stream_filtered(
-                    child, &pat, all_files, opts,
+                    child, &pat, all_files, opts, &gi_root,
                     "", i == m - 1, 1, false,
                     &mut counters, &mut matched, &mut pending, tty,
                 );
@@ -1029,7 +1190,7 @@ fn print_plain(root: &Path, opts: &WalkOpts, pattern: Option<&str>) {
             }
         } else {
             for (i, child) in children.iter().enumerate() {
-                let (sz, _) = stream_node(child, opts, "", i == n - 1, 1, &mut counters, tty);
+                let (sz, _) = stream_node(child, opts, &gi_root, "", i == n - 1, 1, &mut counters, tty);
                 total_sz += sz;
             }
         }
@@ -1057,9 +1218,13 @@ fn print_json(node: &TreeNode, depth: usize, opts: &WalkOpts) {
     let ni = "  ".repeat(depth + 1);
     let kind = if node.is_dir { "directory" } else { "file" };
     let name = serde_json_escape(&node.name);
+    // -f/-R: emit the path alongside the name so consumers (jq, …) get usable paths
+    let path_part = if opts.full_path || opts.relative_base.is_some() {
+        format!(", \"path\": \"{}\"", serde_json_escape(&display_path(&node.path, opts)))
+    } else { String::new() };
 
     if node.is_dir {
-        println!("{}{{\"{}\": \"{}\", \"contents\": [", indent, kind, name);
+        println!("{}{{\"{}\": \"{}\"{}, \"contents\": [", indent, kind, name, path_part);
         let last = node.children.len().saturating_sub(1);
         for (i, child) in node.children.iter().enumerate() {
             print_json(child, depth + 1, opts);
@@ -1067,7 +1232,7 @@ fn print_json(node: &TreeNode, depth: usize, opts: &WalkOpts) {
         }
         print!("{}]}}", indent);
     } else {
-        print!("{}{{\"type\": \"file\", \"name\": \"{}\"}}", ni, name);
+        print!("{}{{\"type\": \"file\", \"name\": \"{}\"{}}}", ni, name, path_part);
     }
 }
 
@@ -1075,8 +1240,8 @@ fn serde_json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn output_json(root: &Path, opts: &WalkOpts) {
-    let tree = build_tree(root, opts, 0);
+fn output_json(root: &Path, opts: &WalkOpts, gi: &GiStack) {
+    let tree = build_tree(root, opts, gi, 0);
     println!("[");
     print_json(&tree, 1, opts);
     println!();
@@ -1089,23 +1254,26 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-fn print_xml(node: &TreeNode, depth: usize) {
+fn print_xml(node: &TreeNode, depth: usize, opts: &WalkOpts) {
     let indent = "  ".repeat(depth);
     let name = xml_escape(&node.name);
+    let path_part = if opts.full_path || opts.relative_base.is_some() {
+        format!(" path=\"{}\"", xml_escape(&display_path(&node.path, opts)))
+    } else { String::new() };
     if node.is_dir {
-        println!("{}<directory name=\"{}\">", indent, name);
-        for child in &node.children { print_xml(child, depth + 1); }
+        println!("{}<directory name=\"{}\"{}>", indent, name, path_part);
+        for child in &node.children { print_xml(child, depth + 1, opts); }
         println!("{}</directory>", indent);
     } else {
-        println!("{}<file name=\"{}\"/>", indent, name);
+        println!("{}<file name=\"{}\"{}/>", indent, name, path_part);
     }
 }
 
-fn output_xml(root: &Path, opts: &WalkOpts) {
-    let tree = build_tree(root, opts, 0);
+fn output_xml(root: &Path, opts: &WalkOpts, gi: &GiStack) {
+    let tree = build_tree(root, opts, gi, 0);
     println!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
     println!("<tree>");
-    print_xml(&tree, 1);
+    print_xml(&tree, 1, opts);
     println!("</tree>");
 }
 
@@ -1114,6 +1282,7 @@ fn output_xml(root: &Path, opts: &WalkOpts) {
 #[derive(Debug)]
 pub struct TreeNode {
     pub name: String,
+    pub path: PathBuf,
     pub is_dir: bool,
     pub children: Vec<TreeNode>,
 }
@@ -1131,16 +1300,20 @@ impl TreeNode {
     }
 }
 
-pub fn build_tree(path: &Path, opts: &WalkOpts, depth: usize) -> TreeNode {
+fn build_tree(path: &Path, opts: &WalkOpts, gi: &GiStack, depth: usize) -> TreeNode {
     let name = node_name(path);
     let is_dir = is_dir_entry(path, opts.follow_links);
     let mut children = vec![];
     if is_dir && opts.max_depth.map_or(true, |m| depth < m) {
-        for child in read_children(path, opts) {
-            children.push(build_tree(&child, opts, depth + 1));
+        let gi_child = gi.desc(path, opts.gitignore);
+        let mut raw = read_children(path, opts, &gi_child);
+        // --filelimit: don't descend into oversized dirs
+        if opts.filelimit.map_or(false, |n| raw.len() > n) { raw.clear(); }
+        for child in raw {
+            children.push(build_tree(&child, opts, &gi_child, depth + 1));
         }
     }
-    TreeNode { name, is_dir, children }
+    TreeNode { name, path: path.to_path_buf(), is_dir, children }
 }
 
 // ── Flatten (for TUI) ─────────────────────────────────────────────────────────
@@ -1178,11 +1351,12 @@ pub fn flatten(node: &TreeNode, prefix: &str, is_last: bool, depth: usize, searc
 
 // ── TUI loader ────────────────────────────────────────────────────────────────
 
-fn load_tree_with_spinner(path: &Path, opts: WalkOpts) -> TreeNode {
+fn load_tree_with_spinner(path: &Path, opts: WalkOpts, gi: &GiStack) -> TreeNode {
     let (tx, rx) = mpsc::channel::<TreeNode>();
     let p2 = path.to_path_buf();
     let o2 = opts.clone();
-    thread::spawn(move || { let _ = tx.send(build_tree(&p2, &o2, 0)); });
+    let g2 = gi.clone();
+    thread::spawn(move || { let _ = tx.send(build_tree(&p2, &o2, &g2, 0)); });
     let mut i = 0usize;
     loop {
         match rx.try_recv() {
@@ -1201,6 +1375,10 @@ fn load_tree_with_spinner(path: &Path, opts: WalkOpts) -> TreeNode {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    // Die silently on SIGPIPE (e.g. `nt | head`) instead of panicking in println!
+    #[cfg(unix)]
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+
     // When invoked as `newtree`, show help and hint to use `nt`
     let binary_name = std::env::args().next()
         .and_then(|s| std::path::Path::new(&s).file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -1223,23 +1401,57 @@ fn main() {
         std::process::exit(1);
     }
 
+    if args.full_path && args.relative {
+        eprintln!("nt: -f and --relative are mutually exclusive");
+        std::process::exit(1);
+    }
+
     let path = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
     if !path.exists() {
         eprintln!("nt: '{}': no such file or directory", path.display());
         std::process::exit(1);
     }
 
+    // -o: point stdout at the file before anything is written (summary/progress
+    // stay on stderr, so the terminal still stays alive).
+    if let Some(out) = &args.output_file {
+        let file = std::fs::File::create(out).unwrap_or_else(|e| {
+            eprintln!("nt: cannot create '{}': {}", out.display(), e);
+            std::process::exit(1);
+        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            if unsafe { libc::dup2(file.as_raw_fd(), 1) } < 0 {
+                eprintln!("nt: cannot redirect output to '{}'", out.display());
+                std::process::exit(1);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            drop(file);
+            eprintln!("nt: -o is not supported on this platform");
+            std::process::exit(1);
+        }
+    }
+
+    // -f/-R need clean paths, and -g matches .gitignore patterns against clean
+    // absolute paths: normalize `.`/`..` in the root up front so every walked
+    // path inherits the clean form.
+    let path = if args.full_path || args.relative || args.gitignore { normalize_abs(&path) } else { path };
+
     let opts = WalkOpts::from_args(&args, &path);
+    let gi = GiStack::root();
 
     if args.tui {
         let search = args.search.unwrap_or_default();
-        let root = load_tree_with_spinner(&path, opts);
+        let root = load_tree_with_spinner(&path, opts, &gi);
         tui::run_tui(root, search).expect("TUI error");
     } else if opts.output == OutputFmt::Json {
-        output_json(&path, &opts);
+        output_json(&path, &opts, &gi);
     } else if opts.output == OutputFmt::Xml {
-        output_xml(&path, &opts);
+        output_xml(&path, &opts, &gi);
     } else {
-        print_plain(&path, &opts, args.pattern.as_deref());
+        print_plain(&path, &opts, &gi, args.pattern.as_deref());
     }
 }
